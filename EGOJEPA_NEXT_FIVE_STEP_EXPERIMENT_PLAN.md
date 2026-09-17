@@ -1,205 +1,274 @@
-# EgoJEPA-MP：下一阶段实验计划（Step 1B 后最终执行顺序）
+# EgoJEPA-MP：下一阶段实验计划（Step 4B 后更新版）
 
-> 本文面向 Codex 执行，基于当前 JAAD `K=4` 模型、已完成的 mode-selection diagnostics、posterior cheap diagnostics、Step 1 与 Step 1B。
+> 本文面向 Codex 执行，基于 JAAD `K=4` 当前主线实验。Step 1 / 1B / 2A / 2B / 2C / 4A / 4B 已完成。
 >
-> **最新结论：暂时不优先升级 Posterior 架构。** Step 1B 已证明：仅训练当前 FutureModePosterior 的 prototype 参数，就可以让 posterior 学到一部分 trajectory-relevant mode semantics，并显著降低 `G_mode`。因此下一阶段首先闭环训练 posterior–trajectory grounding 与 trajectory specialization；只有在 simple posterior 明显 plateau 时，才进入 Temporal Plan Encoder。
+> **最新结论：不再继续堆叠 Prior 容量。** Step 4A 证明重新拟合原 state-token MLP prior 是必要的；Step 4B 的 mode-query cross-attention prior 在测试集上整体和 crossing 子集均退化，因此不替换 Step 4A。下一阶段的核心问题转为：**如何让 future mode 既具有 trajectory discrimination，又能从 past context 被可靠预测。**
 
 ---
 
-# 0. 当前证据与结论
+# 0. 已完成实验与当前证据
 
-## 0.1 原始 JAAD 基线
-
-测试集：
-
-```text
-Posterior ADE          = 20.298
-G_mode                 = 3.496
-Posterior↔Oracle       = 61.13%
-mode 1/2 hard usage    = 0%
-mode 1/2 soft usage    = 0.87%
-```
-
-同时已经确认：
-
-- `minADE@4 < top-1 ADE`，说明 K 个候选中存在真正有价值的 alternative futures；
-- oracle 最优模式为 mode 1/2 的样本占测试集约 `37.27%`；
-- 原 posterior 几乎从不选择 mode 1/2；
-- 原 prior 与 posterior 高度一致，因此此前优先增强 prior 没有意义。
-
----
-
-## 0.2 Step 1 结论
-
-原 soft responsibility：
-
-```math
-r_k \propto \exp(-E_k/\tau_r)
-```
-
-在当前 trajectory loss scale 下过于平坦，平均最大 responsibility 约 `0.262`，几乎等于 K=4 均匀分布的 `0.25`。
-
-因此 Step 1 主要是在把 posterior 拉平，并没有建立可靠 trajectory semantics。
-
-> 原 Step 1 soft responsibility 不再作为主 responsibility 使用。
-
----
-
-## 0.3 Step 1B 结果
-
-Step 1B 比较：
-
-```text
-R1 = Hard oracle responsibility
-R2 = Label-smoothed oracle responsibility
-```
-
-只训练当前 Posterior 的 `1,024` 个 prototype 参数，其余模型全部冻结。
+## 0.1 Step 1B：Posterior trajectory grounding 有效
 
 JAAD 测试集：
 
-| 指标 | 原始 B0 | R1 Hard oracle | R2 Label-smoothed |
-|---|---:|---:|---:|
-| Posterior ADE ↓ | 20.298 | **19.253** | 19.329 |
-| G_mode ↓ | 3.496 | **2.451** | 2.527 |
-| Posterior↔Oracle ↑ | 61.13% | **66.76%** | 65.42% |
-| mode 1/2 hard usage | 0% | **23.32%** | 16.35% |
-| mode 1/2 soft usage | 0.87% | **38.61%** | 36.64% |
+| 指标 | 原始 B0 | Step 1B R1 Hard oracle |
+|---|---:|---:|
+| Posterior ADE ↓ | 20.298 | 19.253 |
+| G_mode ↓ | 3.496 | 2.451 |
+| Posterior↔Oracle ↑ | 61.13% | 66.76% |
+| mode 1/2 hard usage | 0% | 23.32% |
 
-R1 使 `G_mode` 缩小约 `29.9%`，说明当前 fixed future representation + simple prototype posterior 具备一定 trajectory-mode 识别能力。
+结论：当前 simple posterior 并非完全没有能力识别 trajectory-relevant mode，R1 hard-oracle alignment 是有效方向。
 
-但恢复仍不完整：
+---
+
+## 0.2 Step 2：Posterior alignment + sharpened routing 有效，但存在副作用
+
+JAAD 测试集：
+
+| 指标 | Step 1B R1 | Step 2 R1 |
+|---|---:|---:|
+| Posterior ADE ↓ | 19.253 | **18.517** |
+| G_mode ↓ | 2.451 | **1.504** |
+| Posterior↔Oracle ↑ | 66.76% | **77.75%** |
+| mode 1 recall ↑ | 6.94% | **56.60%** |
+| minADE@4 ↓ | **16.802** | 17.013 |
+| Intention AP ↑ | **0.232** | 0.179 |
+
+结论：
 
 ```text
-mode 1 recall ≈ 6.94%
+posterior–trajectory semantics 明显改善；
+但 candidate quality 有小幅回退；
+意图 AP 出现负迁移；
+旧 prior 因 posterior semantics 改变而严重失配。
 ```
 
-收益主要来自 mode 2，因此不能认为四个 trajectory modes 已经全部形成稳定语义。
+因此 Step 2 后首先需要重新拟合 prior，而不是直接判断 deployment top-1。
 
-### Step 1B 最终判断
+---
+
+## 0.3 Step 4A：重新拟合原 state-token MLP Prior 有效
+
+只更新原 prior 的 `67,332` 个参数，其余权重全部冻结。
+
+JAAD 测试集：
+
+| 指标 | 拟合前 | Step 4A MLP 拟合后 |
+|---|---:|---:|
+| KL(q||π) ↓ | 2.7372 | **0.1334** |
+| G_prior ↓ | 11.1958 | **3.3379** |
+| Top1 ADE ↓ | 29.7125 | **21.8546** |
+| Top1 FDE ↓ | 59.5575 | **46.2423** |
+| Prior↔Posterior ↑ | 38.87% | **78.82%** |
+| Intention F1 ↑ | 0.2440 | **0.2696** |
+| Intention AP ↑ | 0.1789 | **0.2154** |
+
+但：
 
 ```text
-1. 当前 Posterior 架构不是首先需要替换的模块。
-2. posterior–trajectory grounding 确实有效。
-3. R1 当前优于 R2，因此后续主线使用 R1。
-4. 下一步进入 Step 2，而不是直接进入 Plan Transformer。
-5. 后续所有诊断必须按 mode 单独报告，不能继续只看 mode1/2 合并统计。
+Crossing Top1 ADE: 29.586 → 29.766，无改善
+总体 Top1 ADE 21.855 与原始 baseline 21.907 基本持平
+```
+
+说明：
+
+> 旧 prior 的语义失配基本修复，但仍存在明显 residual selection gap，尤其 crossing 样本。
+
+---
+
+## 0.4 Step 4B：Cross-Attention Prior 不支持替换 Step 4A
+
+新 prior 使用冻结的 mode embeddings，通过 cross-attention 读取完整 past context，其余模块全部冻结。
+
+JAAD 测试集：
+
+| 指标 | Step 4A MLP | Step 4B Cross-attention |
+|---|---:|---:|
+| G_prior ↓ | **3.3379** | 3.9377 |
+| Top1 ADE ↓ | **21.8546** | 22.4543 |
+| Top1 FDE ↓ | **46.2423** | 47.5202 |
+| Prior↔Posterior ↑ | **78.82%** | 75.60% |
+| Crossing G_prior ↓ | **8.7922** | 9.2235 |
+| Crossing Top1 ADE ↓ | **29.7657** | 30.1970 |
+
+paired video bootstrap 也支持 Step 4B 的退化不是纯随机波动。
+
+### Step 4B 最终结论
+
+```text
+1. 不使用 Step 4B 替换 Step 4A。
+2. 保留 state-token MLP Prior 作为当前 Prior baseline。
+3. 当前问题不再优先解释为“Prior 没看到足够完整 context”。
+4. 更可能的问题是：部分 posterior future modes 事后可区分，但仅凭 past observation 难以预测。
+5. 下一阶段应改变 mode discovery 的目标，而不是继续增加 Prior 容量。
 ```
 
 ---
 
-# 1. 总体实验原则
+# 1. 下一阶段核心科学问题
 
-## 1.1 固定条件
+当前 Posterior 学的是：
 
-- `K=4` 暂时固定；
-- JAAD 作为第一验证数据集；
-- epoch 88 checkpoint 保留为原始基线 B0；
-- Step 2 从 **Step 1B validation 选出的 R1 best posterior** 初始化；
-- 每个阶段使用独立配置和独立输出目录；
-- 不覆盖历史 checkpoint；
-- 所有超参数只使用 validation 选择；
-- test 只运行 validation 已冻结的配置；
-- 不基于 test 调 lr / epoch / temperature / loss weight；
-- 每次 posterior / routing / prior 发生变化后重新运行 mode diagnostic；
-- 复用现有 bbox decode、ADE/FDE、intent metrics 与 diagnostics；
-- GitHub Markdown 数学统一使用 `math` fenced block。
+```math
+q(M\mid Y_{future})
+```
+
+它越来越擅长回答：
+
+> “看到真实未来以后，这条 future 最适合哪个 trajectory mode？”
+
+而 Prior 需要回答：
+
+```math
+\pi(M\mid X_{past})
+```
+
+即：
+
+> “只看过去，哪个 mode 最可能发生？”
+
+这两件事不天然等价。
+
+当前实验表明：
+
+```text
+trajectory-discriminative mode ≠ necessarily past-predictable mode
+```
+
+因此下一阶段要把 mode discovery 改成：
+
+```text
+Good future mode
+= trajectory-discriminative
++ past-predictable
+```
+
+而不是继续单方面增强 Posterior 或 Prior。
 
 ---
 
-## 1.2 后续统一主指标
+# 2. 最新执行顺序
 
-每一步持续报告：
-
-```text
-ADE_oracle
-ADE_posterior
-ADE_prior
-G_mode = ADE_posterior - ADE_oracle
-G_prior = ADE_prior - ADE_posterior
-posterior↔oracle agreement
-prior↔posterior agreement
-prior↔oracle agreement
-minADE@4
-top1 ADE
-minFDE@4
-top1 FDE
-posterior entropy
-prior entropy
-intent F1 / AUC / AP
-```
-
-从 Step 2 开始必须按 mode 分开报告：
+严格按以下顺序执行：
 
 ```text
-mode0 oracle frequency
-mode1 oracle frequency
-mode2 oracle frequency
-mode3 oracle frequency
-
-mode0 posterior recall / precision
-mode1 posterior recall / precision
-mode2 posterior recall / precision
-mode3 posterior recall / precision
-
-mode-wise hard usage
-mode-wise soft usage
-mode-wise q_oracle
-mode-wise ADE gain when oracle
+Step 5-0  Prior 可预测性诊断
+    ↓
+Step 5A   Predictability-aware Mode Discovery（小权重双向一致性）
+    ↓
+Step 5A-Diagnostic  同时检查 G_mode / G_prior / candidate quality / intention
+    ↓
+Step 5B   若 5A 有效：Predictability-aware joint specialization
+    ↓
+Step 5C   冻结新 mode semantics，重新拟合 Step 4A MLP Prior
+    ↓
+Step 5D   最终再拆分 Pretraining：A1 mode discovery + A2 prior fitting
 ```
 
-特别注意：mode 2 的恢复不能掩盖 mode 1 仍然失效的问题。
+### 暂停项
+
+```text
+Step 3 Plan Transformer        = 暂停，降为可选结构消融
+Step 4B Cross-attention Prior  = 负结果，不再作为主线
+更大 Prior                    = 暂停
+K=2/8 sensitivity             = 暂停
+Diffusion / 新 backbone       = 不进入当前阶段
+```
 
 ---
 
-# 2. Step 1 / Step 1B：已完成
-
-```text
-Step 1  = DONE
-Step 1B = DONE
-```
-
-后续固定：
-
-```text
-主 responsibility = R1 Hard oracle
-主要消融          = R2 Label-smoothed oracle
-```
-
-不要继续搜索原 Step 1 的近均匀 soft responsibility。
-
----
-
-# 3. Step 2A：R1 Posterior 短 Warm-up
+# 3. Step 5-0：先诊断哪些 future modes 从 Past 最难预测
 
 ## 3.1 目的
 
-在正式让 trajectory branch 一起移动之前，先让 validation 选出的 R1 posterior 稳定少量 epoch，降低 posterior 与 decoder 同时漂移的风险。
+在改变训练目标前，先确认 `G_prior` 主要来自哪些 mode / crossing 子群。
+
+使用当前：
+
+```text
+Posterior / decoder = Step 2 最优 checkpoint
+Prior               = Step 4A state-token MLP best checkpoint
+```
+
+不训练模型，只跑 validation / test diagnostics。
 
 ---
 
-## 3.2 初始化
+## 3.2 必须按 mode 报告
+
+```text
+posterior mode frequency
+prior hard usage
+prior recall per posterior mode
+prior precision per posterior mode
+prior↔posterior confusion matrix
+prior↔oracle confusion matrix
+G_prior per posterior mode
+ADE_prior per posterior mode
+posterior entropy per mode
+prior entropy per mode
+```
+
+并对：
+
+```text
+all
+crossing=0
+crossing=1
+```
+
+分别报告。
+
+---
+
+## 3.3 重点回答
+
+1. crossing 样本的大 `G_prior` 是否集中在特定 mode？
+2. 哪些 posterior modes 虽然 trajectory oracle 价值高，但 prior recall 极低？
+3. 这些 mode 是否具有高 posterior confidence、低 prior confidence？
+4. 是否存在 posterior 过于细分、但 past context 无法分辨的 mode pair？
+
+输出：
+
+```text
+step5_prior_predictability_summary.json
+step5_prior_predictability_samples.csv
+step5_prior_predictability_report.md
+```
+
+---
+
+# 4. Step 5A：Predictability-aware Mode Discovery
+
+## 4.1 目的
+
+让 posterior mode 不只满足 trajectory discrimination，还受到来自 past prior 的轻量 predictability regularization。
+
+核心原则：
+
+> 不允许 predictability loss 压过 trajectory semantics，否则 posterior 可能退化为“最容易从 past 预测”的粗粒度 mode。
+
+因此从 Step 2 + Step 4A 的现有模型开始，只做小权重实验。
+
+---
+
+## 4.2 初始化
 
 加载：
 
 ```text
-base model weights   = epoch 88 checkpoint
-posterior/prototypes = Step 1B validation 选出的 R1 best posterior
+Posterior / decoder / trajectory head = Step 2 validation best
+Prior                                = Step 4A MLP validation best
+context encoders                     = 对应 Step 2 frozen weights
 ```
 
-必须验证以下权重与 epoch 88 完全一致：
-
-```text
-future predictor / decoder
-trajectory head
-mode embeddings
-context encoders
-Past Mode Prior
-```
+第一阶段保持 trajectory candidate 本身固定，先只测试 mode semantics 能否在两种约束之间找到更好的平衡。
 
 ---
 
-## 3.3 冻结规则
+## 4.3 第一阶段冻结规则
 
 冻结：
 
@@ -212,22 +281,25 @@ future predictor / decoder
 mode embeddings
 trajectory head
 intention head
-Past Mode Prior
 EMA target encoders
-dual-target projectors
 ```
 
-仅训练：
+训练：
 
 ```text
 FutureModePosterior / prototypes
+Step 4A state-token MLP Prior
 ```
+
+不要使用 Step 4B cross-attention prior。
 
 ---
 
-## 3.4 Responsibility 与 loss
+## 4.4 三个 loss
 
-主方案使用 R1：
+### A. Trajectory semantic alignment
+
+继续使用已经验证有效的 R1 Hard oracle：
 
 ```math
 k^{oracle}=\arg\min_k ADE(B^{(k)},B^{gt})
@@ -237,51 +309,166 @@ k^{oracle}=\arg\min_k ADE(B^{(k)},B^{gt})
 L_{align}=-\log(q_{k^{oracle}}+\epsilon)
 ```
 
-R2 仅保留为平行消融。
+它保证 posterior 仍然与 trajectory modes 对齐。
 
 ---
 
-## 3.5 训练建议
+### B. Prior fitting loss
 
-```text
-epochs: 2-3
-lr: 使用 Step 1B validation 已选中的 R1 lr
-optimizer: 沿用 Step 1B
-不重新做大范围 lr search
-```
+只更新 Prior，使其拟合当前 posterior：
 
-如果 validation `G_mode` 相对 Step 1B best 明显恶化，则直接回退 Step 1B best posterior，不使用 warm-up 权重进入 Step 2B。
-
----
-
-# 4. Step 2B：Posterior Alignment + Sharpened Trajectory Routing
-
-## 4.1 当前主实验
-
-目标：
-
-> 把 FutureModePosterior 的 mode semantics 与 trajectory specialization 真正闭环训练，而不是继续让所有 trajectory modes 被同一个 GT 通过 raw soft-q 权重同时拉近。
-
-当前可能存在的反馈环：
-
-```text
-q_k 低
-→ mode k 获得的 trajectory supervision 弱
-→ specialization 不稳定
-→ posterior 更少选择 mode k
-→ q_k 进一步降低
+```math
+L_{prior\_fit}
+=
+KL(stopgrad(q)\,\|\,\pi)
 ```
 
 ---
 
-## 4.2 解冻模块
+### C. Predictability regularizer
 
-从 Step 2A 最优状态或 Step 1B R1 best 开始。
+反向约束 posterior，使其不要定义完全无法从 past 推断的 mode：
 
-解冻：
+```math
+L_{predict}
+=
+KL(q\,\|\,stopgrad(\pi))
+```
+
+注意：
+
+```text
+L_prior_fit 只给 Prior 梯度
+L_predict   只给 Posterior 梯度
+```
+
+这样避免一个 KL 同时让两边互相追逐造成实现含义不清。
+
+---
+
+## 4.5 总 loss
+
+```math
+L_{5A}
+=
+L_{align}
++
+\lambda_{fit}L_{prior\_fit}
++
+\lambda_{pred}L_{predict}
+```
+
+建议：
+
+```text
+lambda_fit  = 1.0
+lambda_pred = 0.01 / 0.05 / 0.1
+```
+
+只用 validation 选择 `lambda_pred`。
+
+第一轮不要超过 `0.1`，避免 posterior 被 prior 过度牵引。
+
+---
+
+## 4.6 关键防 collapse 监控
+
+必须持续报告：
+
+```text
+posterior hard / soft usage per mode
+posterior entropy
+prior entropy
+posterior↔oracle
+prior↔posterior
+mode-wise oracle frequency
+mode-wise posterior recall
+mode-wise prior recall
+```
+
+如果出现：
+
+```text
+G_prior 下降
+但 G_mode 明显上升
+```
+
+说明 predictability weight 过大，不能视为成功。
+
+---
+
+# 5. Step 5A-Diagnostic：双 Gap 联合判定
+
+Step 5A 完成后重新计算：
+
+```math
+G_{mode}=ADE_{posterior}-ADE_{oracle}
+```
+
+```math
+G_{prior}=ADE_{prior}-ADE_{posterior}
+```
+
+以及：
+
+```text
+ADE_oracle
+ADE_posterior
+ADE_prior
+minADE@4
+top1 ADE
+posterior↔oracle
+prior↔posterior
+prior↔oracle
+mode-wise posterior recall
+mode-wise prior recall
+crossing G_mode
+crossing G_prior
+crossing top1 ADE
+intention F1/AUC/AP
+```
+
+### Step 5A 成功标准
+
+相对 Step 2 + Step 4A：
+
+```text
+1. G_prior 明显下降；
+2. G_mode 不能明显恶化，最好同步下降；
+3. posterior↔oracle 保持或提升；
+4. prior↔posterior 提升；
+5. minADE@4 不恶化；
+6. crossing G_prior 有实质改善；
+7. intention AP 不进一步明显下降。
+```
+
+核心判断不是单独最小化某一个 gap，而是改善：
+
+```math
+G_{total}=G_{mode}+G_{prior}=ADE_{prior}-ADE_{oracle}
+```
+
+同时保留 candidate quality。
+
+---
+
+# 6. Step 5B：Predictability-aware Joint Specialization
+
+> 仅当 Step 5A 证明 predictability-aware mode discovery 有效时执行。
+
+## 6.1 目的
+
+在 Step 5A 已找到更可预测的 mode semantics 后，再允许 trajectory branch 一起适配，使新的 mode semantics 与 trajectory specialization 闭环。
+
+---
+
+## 6.2 解冻
+
+训练：
 
 ```text
 FutureModePosterior / prototypes
+Step 4A MLP Prior
 future predictor / mode-conditioned decoder
 mode embeddings
 trajectory head
@@ -294,421 +481,105 @@ intention head
 visual/context encoder
 motion/context encoder
 ego projection
-fusion transformer
-Past Mode Prior
+fusion
 EMA target encoders
 ```
 
-如果本阶段没有 JEPA anchoring，则 dual-target projectors 继续冻结。
-
-Codex 必须保存：
-
-```text
-trainable_parameters.txt
-frozen_parameters.txt
-```
-
 ---
 
-## 4.3 Posterior alignment
+## 6.3 Loss
 
-主方案继续使用 R1 Hard oracle：
-
-```math
-k^{oracle}=\arg\min_k ADE(B^{(k)},B^{gt})
-```
+保留 Step 2 已验证的 sharpened routing：
 
 ```math
-L_{align}=-\log(q_{k^{oracle}}+\epsilon)
+L_{traj}^{sharp}=\sum_k stopgrad(\tilde q_k)L_k
 ```
 
-候选：
-
-```text
-lambda_align = 0.05 / 0.1 / 0.25
-```
-
-只在 validation 选择。
-
-R2 使用 Step 1B validation 选出的 label smoothing 参数作为主要消融。
-
----
-
-## 4.4 Sharpened trajectory routing
-
-当前 raw routing：
+联合：
 
 ```math
-L_{traj}=\sum_k q_k L_k
-```
-
-改为：
-
-```math
-\tilde q_k
-=
-\frac{q_k^{1/\tau_{traj}}}
-{\sum_j q_j^{1/\tau_{traj}}}
-```
-
-```math
-L_{traj}=\sum_k stopgrad(\tilde q_k)L_k
-```
-
-其中：
-
-```math
-L_k=SmoothL1(B^{(k)},B^{gt})
-```
-
-必须 stop-gradient routing weights，避免 trajectory regression loss 直接通过 `q` 操纵 mode probability。
-
----
-
-## 4.5 Temperature schedule
-
-第一轮使用保守 schedule：
-
-```text
-前 25% epoch:  tau_traj = 1.0
-25%-60%:       tau_traj = 0.5
-后 40%:        tau_traj = 0.25
-```
-
-配置必须支持切回原始 soft routing：
-
-```yaml
-trajectory_routing:
-  type: soft | sharpened
-  tau_start: 1.0
-  tau_mid: 0.5
-  tau_end: 0.25
-```
-
-第一轮不要直接 hard routing，因为 Step 1B `posterior↔oracle` 仍只有约 `66.76%`。
-
----
-
-## 4.6 推荐联合 task loss
-
-```math
-L_{step2}
+L_{5B}
 =
 L_{traj}^{sharp}
 +
 \lambda_{align}L_{align}
 +
+\lambda_{fit}L_{prior\_fit}
++
+\lambda_{pred}L_{predict}
++
 0.5L_{intent}
 ```
 
-本阶段不要同时加入：
+`lambda_pred` 优先沿用 Step 5A validation 选出的值，不重新大范围搜索。
+
+---
+
+## 6.4 成功标准
+
+必须同时看：
 
 ```text
-Plan Transformer
-Cross-Attention Prior
-A1/A2 pretraining split
-新的 backbone
-Diffusion
+G_mode
+G_prior
+G_total
+minADE@4
+top1 ADE
+crossing top1 ADE
+posterior/prior mode-wise recall
+intention AP/F1
+trajectory diversity
 ```
+
+不能为了降低 `G_prior` 而牺牲大量 `minADE@4` 或 `G_mode`。
 
 ---
 
-## 4.7 必须监测 trajectory specialization
+# 7. Step 5C：冻结新 Mode Semantics，重新做最终 MLP Prior Fitting
 
-```text
-pairwise endpoint distance
-pairwise trajectory distance
-pairwise latent cosine similarity
-mode-wise oracle frequency
-mode-wise posterior recall
-mode-wise posterior precision
-mode-wise hard usage
-mode-wise soft usage
-```
-
-重点防止：
-
-```text
-A. 所有 mode 再次收敛成几乎同一条轨迹
-B. mode 被人为拉开，但出现不合理候选
-```
-
----
-
-## 4.8 Step 2B 成功标准
-
-相对 Step 1B R1：
-
-```text
-Posterior ADE = 19.253
-G_mode        = 2.451
-Post↔Oracle   = 66.76%
-mode1 recall  ≈ 6.94%
-```
-
-期望：
-
-- `G_mode` 继续明显下降；
-- `ADE_posterior` 继续向 `ADE_oracle` 靠近；
-- `posterior↔oracle` 继续提升；
-- mode 1 recall 明显高于 6.94%；
-- mode-wise hard usage 更接近各自 oracle frequency；
-- `minADE@4` 不恶化，最好进一步下降；
-- trajectory diversity 不 collapse；
-- intention F1/AUC/AP 不出现明显负迁移。
-
----
-
-# 5. Step 2C：重新执行三层 Mode Diagnostic
-
-Step 2B 完成后，必须重新计算：
-
-```math
-ADE_{oracle}
-```
-
-```math
-ADE_{posterior}
-```
-
-```math
-ADE_{prior}
-```
-
-以及：
-
-```math
-G_{mode}=ADE_{posterior}-ADE_{oracle}
-```
-
-```math
-G_{prior}=ADE_{prior}-ADE_{posterior}
-```
-
-同时报告：
-
-```text
-posterior↔oracle
-prior↔posterior
-prior↔oracle
-per-mode recall / precision
-per-mode hard / soft usage
-crossing/non-crossing subgroup
-minADE@4 / top1 ADE
-```
-
-### 重要解释规则
-
-Step 2 后 Posterior semantics 已经变化，而 Past Mode Prior 仍然是旧 prior，因此：
-
-> **Step 2 的主判断指标是 `G_mode`、Posterior ADE 和 per-mode recall。旧 prior 的 top-1 ADE 不能用于否定 Step 2。**
-
-旧 prior 此时只作为“语义漂移后 prior 失配程度”的诊断。
-
----
-
-# 6. Step 3：仅在 simple Posterior Plateau 时升级 Temporal Plan Encoder
-
-## 6.1 触发条件
-
-只有出现下面一种或多种情况时，Step 3 才从“可选消融”升级为“必要改造”：
-
-- Step 2 后 `G_mode` 下降仍有限；
-- mode 1 recall 仍然很低；
-- posterior↔oracle 明显 plateau；
-- oracle mode 仍大量排 posterior rank 3/4；
-- simple pooled future representation 无法识别 crossing timing / stop-go / acceleration pattern。
-
-如果 Step 2 已经很好，则 Step 3 只作为架构消融。
-
----
-
-## 6.2 新 Posterior 结构
-
-将当前 simple pooling 替换为：
-
-```text
-future motion EMA tokens [B,30,256]
-        ↓
-LayerNorm
-        ↓
-Temporal positional embedding
-        ↓
-2-layer Transformer encoder
-        ↓
-learnable PLAN query
-        ↓
-attention pooling over 30 future tokens
-        ↓
-plan embedding [B,256]
-        ↓
-mode prototypes
-        ↓
-posterior q [B,K]
-```
-
-不要把 future image 引入 mode posterior。
-
-配置：
-
-```yaml
-future_mode_posterior:
-  type: simple_pool | plan_transformer
-  layers: 2
-  hidden_dim: 256
-  heads: 8
-  dropout: 0.1
-  pooling: plan_query
-```
-
-必须保留 `simple_pool` 做公平对照。
-
----
-
-## 6.3 核心对照
-
-| Posterior | Alignment | Routing | 目的 |
-|---|---|---|---|
-| simple_pool | R1 | sharpened | Step 2 主模型 |
-| plan_transformer | R1 | sharpened | Step 3 |
-
-判断：Plan Transformer 是否在相同 responsibility 与 routing 下进一步降低 `G_mode`。
-
----
-
-# 7. Step 4A：Posterior 稳定后，先重新训练原 State-Token MLP Prior
-
-## 7.1 为什么必须先做 4A
-
-Posterior semantics 经 Step 2/3 修改后，旧 prior 不再是公平对照。
-
-因此不能直接把旧 prior 的失败归因于：
-
-```text
-context[:,0] + MLP 能力不足
-```
-
-必须先让相同架构重新拟合**新的稳定 posterior**。
-
----
-
-## 7.2 冻结规则
+Step 5B 完成后：
 
 冻结：
 
 ```text
-context representation
-future predictor / decoder
+Posterior
+prototypes
+trajectory decoder
 mode embeddings
-trajectory head
-intention head
-FutureModePosterior / prototypes
-EMA teacher
+context encoders
+任务头
 ```
 
 只训练：
 
 ```text
-现有 Past Mode Prior:
-context[:,0] → MLP → K logits
+Step 4A state-token MLP Prior
 ```
 
----
-
-## 7.3 Prior target
+目标：
 
 ```math
-L_{prior}=KL(stopgrad(q)\,\|\,\pi)
+L_{5C}=KL(stopgrad(q)\,\|\,\pi)
 ```
 
-或沿用当前 prior NLL/CE 实现，只要 target 是已经冻结的 posterior。
+目的：把“mode discovery 本身的质量”和“最后 prior 是否充分拟合”重新分离。
 
----
-
-## 7.4 重新测
+输出最终：
 
 ```text
-G_prior all
-G_prior crossing=0
-G_prior crossing=1
-prior↔posterior
-prior↔oracle
-top1 ADE / FDE
-intent F1 / AUC / AP
-```
-
-只有此时才能公平判断 state-token MLP 是否真的不足。
-
----
-
-# 8. Step 4B：只有原 Prior 仍不足，才升级 Mode-Query Cross Attention Prior
-
-## 8.1 触发条件
-
-重新训练原 Prior 后，如果：
-
-- `G_prior` 仍明显；
-- 尤其 crossing subgroup `G_prior` 仍高；
-- prior↔posterior / prior↔oracle 仍明显不足；
-
-才升级 prior 架构。
-
----
-
-## 8.2 新 Prior
-
-使用 K 个 mode embeddings 作为 query 读取完整 context：
-
-```text
-K mode queries [K,D]
-        ↓
-Cross Attention
-        ↓
-context memory [B,33,D]
-        ↓
-mode-specific context [B,K,D]
-        ↓
-shared/small MLP scorer
-        ↓
-prior logits [B,K]
-```
-
-```math
-h_k=CrossAttn(e_k,C,C)
-```
-
-```math
-s_k=f(h_k)
-```
-
-```math
-\pi=softmax(s)
+best_mode_semantics.pt
+best_prior.pt
 ```
 
 ---
 
-## 8.3 判断标准
+# 8. Step 5D：最后再拆分 Pretraining A1 / A2
 
-新 prior 必须至少改善：
-
-```text
-G_prior
-或 top1 ADE/FDE
-```
-
-仅仅提升 `prior↔posterior agreement` 不能证明有效。
-
-特别关注 crossing subgroup。
+只有 Step 5A–5C 证明 predictability-aware mode semantics 确实有价值后，才回到完整 JEPA pretraining 流程重新设计 checkpoint selection。
 
 ---
 
-# 9. Step 5：最后拆分 Pretraining 为 A1 + A2
-
-只有 Posterior、trajectory routing 和 Prior 架构都稳定后，才修改预训练阶段。
-
----
-
-## 9.1 A1：Representation + Future Mode Discovery
+## 8.1 A1：Representation + Predictability-aware Mode Discovery
 
 训练：
 
@@ -722,27 +593,14 @@ mode embeddings
 dual-target projectors
 ```
 
-冻结或不训练 Past Mode Prior。
+Past Prior 不作为 representation checkpoint 的主选模项。
 
-Loss 建议：
-
-```math
-L_{A1}
-=
-L_{dualJEPA}
-+
-\lambda_{align}L_{align}
-+
-\lambda_{usage}L_{usage}
-```
-
-若 trajectory alignment 在纯 pretraining 数据流中不可稳定定义，可把 alignment 留到后续 task stage；Codex 必须根据当前实现确认后再启用。
-
-A1 checkpoint selection：
+A1 核心目标：
 
 ```text
-主要依据 val JEPA / dual-target reconstruction
-同时要求 mode 不 collapse
+JEPA future representation
++ trajectory-relevant mode discovery
++ weak past-predictability constraint
 ```
 
 保存：
@@ -751,16 +609,22 @@ A1 checkpoint selection：
 best_repr.pt
 ```
 
-禁止 prior KL 参与 `best_repr` selection。
+### A1 选模禁止项
+
+```text
+禁止用 prior KL 主导 best_repr 评分
+```
+
+必须以 JEPA / representation quality 为主，同时设置 mode-collapse 与 predictability diagnostics 作为约束。
 
 ---
 
-## 9.2 A2：Frozen-Posterior Prior Fitting
+## 8.2 A2：Frozen Mode Semantics Prior Fitting
 
-加载 `best_repr.pt` 并冻结：
+冻结：
 
 ```text
-context representation
+best_repr representation
 FutureModePosterior
 prototypes
 mode semantics
@@ -769,21 +633,7 @@ mode semantics
 只训练：
 
 ```text
-Past Mode Prior
-```
-
-目标：
-
-```math
-L_{A2}=KL(stopgrad(q)\,\|\,\pi)
-```
-
-A2 checkpoint selection：
-
-```text
-val prior KL / NLL
-prior↔posterior agreement
-G_prior（诊断）
+state-token MLP Prior
 ```
 
 保存：
@@ -792,92 +642,95 @@ G_prior（诊断）
 best_prior.pt
 ```
 
-这样解决此前 `prior KL` 主导 representation checkpoint、导致早期 epoch 被错误选中的问题。
+如果 A2 后仍有 residual `G_prior`，记录为 observation-to-future-mode 的不可约 ambiguity 候选，而不是继续无止境增加 Prior capacity。
 
 ---
 
-# 10. 最终执行顺序（Codex 必须遵守）
+# 9. Plan Transformer 的新定位
+
+Plan Transformer 暂时**不作为下一步主线**。
+
+只有在以下条件出现时重新启用：
 
 ```text
-Step 1 / Step 1B              DONE
-        ↓
-Step 2A  R1 posterior short warm-up
-        ↓
-Step 2B  R1 alignment + sharpened trajectory routing
-        ↓
-Step 2C  rerun full mode diagnostic
-        ↓
-Step 3   ONLY IF simple posterior plateaus
-         Temporal Plan Encoder
-        ↓
-Step 4A  retrain original state-token MLP prior
-        ↓
-Step 4B  ONLY IF 4A still insufficient
-         Mode-Query Cross-Attention Prior
-        ↓
-Step 5   A1 representation/mode discovery
-         + A2 frozen-posterior prior fitting
+1. Step 5A 在多个 lambda_pred 下都无法兼顾 G_mode 和 G_prior；
+2. 某些 mode 的 posterior recall 仍显著低；
+3. simple pooled future representation 无法表达关键 temporal pattern；
+4. 已排除 responsibility / predictability objective 的问题。
 ```
 
-### 强制依赖关系
+此时再比较：
 
-- 不允许跳过 Step 2C 就判断是否需要 Step 3；
-- 不允许拿旧 prior 的表现直接证明新 Posterior 方案失败；
-- 不允许跳过 Step 4A 直接宣称 state-token MLP prior 不够；
-- 不允许 posterior semantics 仍在变化时执行正式 Prior 架构比较；
-- Step 5 必须基于已经确定的 posterior/routing/prior 设计。
+```text
+simple posterior
+vs
+Temporal Plan Encoder posterior
+```
+
+并保持完全相同的 alignment / predictability / routing 条件。
 
 ---
 
-# 11. 推荐实验编号
+# 10. Step 4B Cross-Attention Prior 的定位
 
-| ID | Posterior | Alignment | Traj Routing | Prior | Pretrain |
-|---|---|---|---|---|---|
-| E0 | simple | off | current soft-q | old state-token MLP | current joint |
-| E1B | simple | R1 prototype-only | unchanged | frozen | no decoder retrain |
-| E2 | simple | R1 | sharpened | old prior frozen | current |
-| E3 | Plan Transformer | R1 | sharpened | old prior frozen | current |
-| E4A | best posterior | fixed | fixed | retrained state-token MLP | current |
-| E4B | best posterior | fixed | fixed | mode-query cross-attn | current |
-| E5 | best posterior | fixed | sharpened | best prior | A1 + A2 split |
+Step 4B 作为**负结果保留**：
 
-R2 Label-smoothed responsibility 始终作为主要 responsibility ablation，不作为默认主线。
+```text
+Step 4A MLP Prior          = 当前主 Prior
+Step 4B Cross-attn Prior   = 不采用
+```
+
+不要删除相关代码和结果，保留用于实验记录和论文 ablation / negative finding。
+
+---
+
+# 11. 新的实验编号建议
+
+| ID | Mode Discovery | Traj Routing | Prior | 目的 |
+|---|---|---|---|---|
+| E0 | Step 2 posterior | sharpened | old prior | posterior semantics baseline |
+| E1 | Step 2 posterior | sharpened | Step 4A MLP refit | current deployment baseline |
+| E2 | predictability-aware | frozen candidates | MLP joint fit | Step 5A |
+| E3 | predictability-aware | sharpened joint | MLP joint fit | Step 5B |
+| E4 | E3 semantics frozen | fixed | MLP refit | Step 5C |
+| E5 | predictability-aware from pretrain | sharpened | A2 MLP | Step 5D |
+
+Step 4B Cross-attention prior 单独作为负对照，不进入主编号序列。
 
 ---
 
 # 12. 每一步统一输出
 
+至少保存：
+
 ```text
-outputs/<exp_name>/
-  config_resolved.yaml
-  train.log
-  trainable_parameters.txt
-  frozen_parameters.txt
-  val_metrics.json
-  test_metrics.json
-  mode_diagnostics_val.json
-  mode_diagnostics_test.json
-  report.md
+config_resolved.yaml
+trainable_parameters.txt
+frozen_parameters.txt
+train.log
+val_metrics.json
+test_metrics.json
+mode_diagnostics_val.json
+mode_diagnostics_test.json
+report.md
 ```
 
-报告必须包含：
+从 Step 5 开始，报告必须同时包含：
 
 ```text
+G_mode
+G_prior
+G_total = G_mode + G_prior
 ADE_oracle
 ADE_posterior
 ADE_prior
-G_mode
-G_prior
 minADE@4
 top1 ADE
-posterior↔oracle
-prior↔posterior
-prior↔oracle
-per-mode recall / precision
-mode-wise usage
-mode-wise oracle frequency
-mode-wise ADE gain
-crossing/non-crossing subgroup
+mode-wise posterior recall
+mode-wise prior recall
+crossing G_mode
+crossing G_prior
+crossing top1 ADE
 intent F1/AUC/AP
 ```
 
@@ -885,37 +738,29 @@ intent F1/AUC/AP
 
 # 13. 必须新增 / 保留的测试
 
-Codex 每一步必须保持已有 diagnostics tests 通过，并确保：
+Codex 必须保持已有 36+ 项相关测试继续通过，并新增：
 
 ```text
-test_hard_oracle_responsibility
-test_label_smoothed_responsibility
-test_alignment_stop_gradient_target
-test_alignment_only_freezing
-test_sharpened_routing_normalization
-test_sharpened_routing_temperature_effect
-test_routing_weights_stop_gradient
-test_modewise_metrics
-test_step2_old_prior_not_used_for_selection
-test_plan_transformer_output_shape
-test_state_token_prior_retrain_freezing
-test_mode_query_prior_output_shape
-test_a1_prior_frozen
-test_a2_repr_frozen
-test_best_repr_selection_ignores_prior_kl
+test_predictability_loss_stopgrad_prior
+test_prior_fit_loss_stopgrad_posterior
+test_step5a_only_posterior_and_prior_trainable
+test_predictability_weight_zero_matches_previous_semantics
+test_no_future_leakage_into_prior
+test_g_total_identity
+test_step5c_only_prior_trainable
+test_cross_attention_prior_not_selected_as_default
 ```
 
 Sanity：
 
 ```text
-K=1 时 routing / alignment 不改变单模式语义
-posterior q / decoder mode / trajectory mode index 始终一致
-future 信息绝不能进入 inference-time prior path
-旧 checkpoint/config 仍可加载
+lambda_pred = 0 时，Step 5A 应退化为 posterior alignment + prior fitting，不得改变数学语义；
+Past Prior inference 绝不能读取 future motion / future bbox / posterior target；
+K=1 时 G_mode / G_prior routing 退化应保持一致性。
 ```
 
 ---
 
-# 14. 给 Codex 的最终执行指令
+# 14. 给 Codex 的最新执行指令
 
-> Step 1 与 Step 1B 已完成。当前不要立即升级 Posterior 架构。先从 Step 1B validation 选出的 R1 Hard-oracle best posterior 出发执行 Step 2A：保持 decoder/context/prior/task heads 冻结，只让 Posterior/prototypes 短暂稳定 2-3 epoch；若 validation G_mode 变差则回退 Step 1B best。随后执行 Step 2B：解冻 Posterior、future predictor/mode-conditioned decoder、mode embeddings、trajectory head 与 intention head，继续冻结 context encoders、fusion、Past Mode Prior 与 EMA teacher；使用 R1 Hard-oracle posterior alignment，并将当前 raw q-weighted trajectory loss 改为 stop-gradient sharpened routing，temperature 按 1.0 → 0.5 → 0.25 分阶段退火。只在 validation 搜索 lambda_align，不基于 test 调参。Step 2B 后必须执行 Step 2C 完整 mode diagnostic，重点看 G_mode、Posterior ADE、posterior↔oracle、每个 mode 的 recall/precision、mode 1 recall、minADE@4 与 trajectory diversity。旧 Past Prior 在 posterior semantics 变化后只能作为诊断，不能用其 top1 ADE 否定 Step 2。只有 simple posterior 在 Step 2 后明显 plateau 时，才执行 Step 3 Temporal Plan Encoder；否则 Step 3 仅作为结构消融。Posterior 稳定后执行 Step 4A：冻结其余模块并重新训练原 `context[:,0] -> MLP` prior，重新测 G_prior；只有重新训练后的简单 Prior 仍不足，尤其 crossing subgroup G_prior 仍高，才执行 Step 4B Mode-Query Cross-Attention Prior。最后执行 Step 5，将 pretraining 拆成 A1 representation/future-mode discovery 与 A2 frozen-posterior prior fitting，分别保存 best_repr.pt 和 best_prior.pt，禁止 prior KL 再参与 representation checkpoint selection。所有阶段使用独立输出目录、保留历史 checkpoint、先 validation 后 test，并逐阶段提交结果，不允许把多个结构改动一次性混在一个实验里。
+> Step 1/1B/2/4A/4B 已完成。不要继续增强 Cross-Attention Prior，也不要直接进入 Plan Transformer。当前保留 Step 4A state-token MLP Prior 作为 Prior baseline，并把 Step 4B 记录为负结果。下一步首先执行 Step 5-0：对 Step 2 Posterior + Step 4A Prior 做 mode-wise / crossing-wise predictability diagnostics，定位 residual G_prior 来自哪些 future modes。然后执行 Step 5A：保持 trajectory candidates 和 context frozen，只训练 FutureModePosterior/prototypes 与 Step 4A MLP Prior，同时使用三项损失：R1 hard-oracle `L_align` 保证 trajectory semantics，`KL(stopgrad(q)||pi)` 只训练 Prior，`KL(q||stopgrad(pi))` 以小权重约束 Posterior 使 mode 更 past-predictable；`lambda_pred` 仅在 validation 搜索 `0.01/0.05/0.1`。Step 5A 后必须同时检查 G_mode、G_prior、G_total、minADE@4、crossing G_prior 和 intention AP，禁止仅以 prior↔posterior agreement 选模。只有 Step 5A 能在不明显破坏 G_mode/candidate quality 的情况下降低 G_prior，才进入 Step 5B：解冻 mode-conditioned decoder、mode embeddings、trajectory/intention heads，保留 Step 2 sharpened routing，做 predictability-aware joint specialization。Step 5B 后执行 Step 5C：冻结新的 mode semantics，仅重新拟合 state-token MLP Prior，得到最终 best_prior。最后才执行 Step 5D，把完整 JEPA pretraining 拆成 A1 representation + predictability-aware mode discovery 和 A2 frozen-mode prior fitting，并禁止 prior KL 再主导 representation checkpoint selection。所有超参数只使用 validation，test 只运行冻结后的配置。
