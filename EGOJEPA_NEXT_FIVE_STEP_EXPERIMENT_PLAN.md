@@ -11,7 +11,9 @@
 > - 在这些样本中，oracle mode 约 74.10% 被 posterior 排到第 3/4 位；
 > - 因此当前首要问题不是单纯 prior 不够强，而是 **FutureModePosterior 与 trajectory mode semantics 严重错位，并伴随 posterior 概率塌缩**。
 >
-> 下一阶段严格按下面五步顺序执行。不要把五步一次性混合实现，否则无法判断每个改动的因果贡献。
+> Step 1 已进一步发现：原 soft responsibility 的平均最大概率仅约 `0.262`，非常接近 K=4 均匀分布的 `0.25`；训练后 mode 1/2 soft usage 虽恢复到约 50%，但测试集 `posterior↔oracle` 反而下降，说明该 soft target 主要把 posterior 拉平，并未建立可靠的 trajectory-mode 语义。
+>
+> 因此在原五个主步骤之间新增 **Step 1B：Responsibility Target Validation**。Step 1B 是进入 Step 2 或 Step 3 之前的强制门槛。
 
 ---
 
@@ -126,7 +128,7 @@ E_k = SmoothL1(B^{(k)}, B^{gt})
 E^{ADE}_k = ADE(B^{(k)}, B^{gt})
 ```
 
-定义 soft trajectory responsibility：
+原 Step 1 定义 soft trajectory responsibility：
 
 ```math
 r_k=
@@ -134,7 +136,7 @@ r_k=
 {\sum_j \exp(-E_j/\tau_r)}
 ```
 
-建议初始尝试：
+原始搜索：
 
 ```text
 tau_r = 0.5, 1.0, 2.0
@@ -203,35 +205,446 @@ Alignment-only：冻结 decoder，仅训练 posterior。
 
 ---
 
-## 1.7 Step 1 判定标准
+## 1.7 Step 1 当前结论
 
-### 若明显成功
+Step 1 已完成，关键现象包括：
 
-满足多数条件：
+- 原 soft responsibility 在所选温度下平均最大概率约 `0.262`，接近四模式均匀分布 `0.25`；
+- mode 1/2 soft usage 从约 1% 恢复到约 50%，但这更像被均匀 target 拉平，而不是学会正确语义；
+- 测试集 `posterior↔oracle` 未提升，反而下降；
+- 新增的 mode 1/2 hard selection 中，只有少部分与 oracle 一致。
 
-- `G_mode` 明显下降；
-- posterior↔oracle agreement 明显上升；
-- mode 1/2 soft/hard usage 恢复；
-- `ADE_posterior` 向 `ADE_oracle` 靠近；
-- oracle/minADE@4 不变（因为 decoder 冻结）；
+因此 Step 1 **不能证明 simple posterior capacity insufficient，也不能证明 alignment idea 无效**。首先需要验证更有判别力的 responsibility target。
 
-则进入 Step 2，并**保留简单 posterior 架构**。
+---
 
-### 若基本学不动
+# Step 1B：Responsibility Target Validation —— R1 Hard Oracle vs R2 Label-Smoothed Oracle
 
-例如：
+> **强制执行。** 在进入 Step 2 的 sharpened routing 或 Step 3 的 Plan Transformer 之前，必须完成本步。
+>
+> 本步只回答一个问题：
+>
+> **在 decoder、future representation、trajectory heads 全部冻结的情况下，当前 simple FutureModePosterior / prototypes 是否有能力从 future representation 识别“哪个既有 trajectory mode 对该 future 最有用”？**
 
-- mode1/2 soft usage 仍接近 0；
-- posterior↔oracle 几乎不变；
-- `G_mode` 几乎不降；
+---
 
-则记录为“simple posterior capacity insufficient”，在 Step 3 优先升级 Plan Encoder。
+## 1B.1 为什么需要 Step 1B
+
+Step 1 的 soft responsibility：
+
+```math
+r_k \propto \exp(-E_k/\tau_r)
+```
+
+在当前 loss scale 下几乎均匀，导致 target 本身没有足够判别信息。
+
+对于 K=4：
+
+```text
+uniform max probability = 0.25
+observed mean max responsibility ≈ 0.262
+```
+
+因此本步不再继续搜索同一种 softmax temperature，而直接比较两种清晰、可解释的 responsibility：
+
+```text
+R1: Hard oracle
+R2: Label-smoothed oracle
+```
+
+不比较第三种 normalized-soft responsibility，避免同时引入新的尺度设计。
+
+---
+
+## 1B.2 冻结规则
+
+加载与 Step 1 相同的 JAAD epoch 88 K=4 checkpoint。
+
+必须冻结：
+
+```text
+visual/context encoder
+motion/context encoder
+ego projection
+fusion transformer
+future predictor / decoder
+mode embeddings
+trajectory head
+intention head
+Past Mode Prior
+EMA target encoders
+dual-target projectors
+```
+
+只允许训练：
+
+```text
+FutureModePosterior 当前可训练参数
+posterior prototypes
+```
+
+当前实现若 FutureModePosterior 实际只有 prototypes 可训练，则保持这一事实，不要额外增加 MLP、Transformer 或 classifier。
+
+必须保存：
+
+```text
+trainable_parameters.txt
+```
+
+并断言其余参数在训练前后逐位或容差范围内不变。
+
+---
+
+## 1B.3 Oracle mode 的统一定义
+
+本步 responsibility 必须以**轨迹几何 oracle**为基准，而不是 encoded-box SmoothL1 的 argmin，避免训练目标与最终诊断 `ADE_oracle` 定义不一致。
+
+对每个样本：
+
+```math
+k^{oracle}
+=
+\arg\min_k ADE(B^{(k)},B^{gt})
+```
+
+其中 ADE 必须复用现有正式 pixel-center ADE 实现。
+
+要求：
+
+```text
+mean_i ADE(i, k_oracle(i)) == 当前 minADE@4
+```
+
+在浮点误差范围内成立。
+
+如果存在完全相同 ADE 的 tie：
+
+- 使用稳定的最小 index tie-break；
+- 记录 tie rate；
+- 不随机选 mode。
+
+---
+
+## 1B.4 R1：Hard Oracle Responsibility
+
+R1 使用 one-hot trajectory oracle：
+
+```math
+r_k^{R1}
+=
+\mathbf{1}[k=k^{oracle}]
+```
+
+Alignment loss：
+
+```math
+L_{R1}
+=
+-\log(q_{k^{oracle}}+\epsilon)
+```
+
+等价于对 oracle mode 做 4 类交叉熵。
+
+### R1 的意义
+
+R1 是一个**capacity upper-bound diagnostic**：
+
+> 如果只训练当前 posterior/prototypes，连明确的 oracle mode label 都无法从 future representation 学出来，那么下一步才有充分理由怀疑 simple pooling / prototype classifier 的表达能力不足，并进入 Step 3。
+
+R1 不是最终方法默认 supervision，也不是 inference-time 可用信息；它只用于诊断和 grounding feasibility。
+
+---
+
+## 1B.5 R2：Label-Smoothed Oracle Responsibility
+
+R2 保留 oracle 的主语义，但避免绝对 one-hot target。
+
+对于 K=4：
+
+```math
+r_{k^{oracle}}^{R2}=1-\epsilon_{ls}
+```
+
+其他 mode：
+
+```math
+r_{k\neq k^{oracle}}^{R2}
+=
+\frac{\epsilon_{ls}}{K-1}
+```
+
+默认首先测试：
+
+```text
+epsilon_ls = 0.10
+```
+
+validation 可额外比较：
+
+```text
+epsilon_ls = 0.05, 0.10, 0.20
+```
+
+但**只能在 validation 选择 epsilon**，选定后固定到 test。
+
+Alignment loss：
+
+```math
+L_{R2}
+=
+-\sum_k r_k^{R2}\log(q_k+\epsilon)
+```
+
+### R2 的意义
+
+R2 回答：
+
+> 在明确告诉 posterior 哪个 trajectory mode 是最优的同时，保留少量不确定性，是否比硬 one-hot 有更好的 val→test 泛化与概率校准？
+
+---
+
+## 1B.6 公平实验矩阵
+
+必须比较三个设置：
+
+| ID | Responsibility | Decoder | Posterior architecture | Trainable params |
+|---|---|---|---|---|
+| B0 | none，原 epoch88 | frozen | current simple | 0 |
+| R1 | Hard oracle | frozen | current simple | posterior/prototypes only |
+| R2 | Label-smoothed oracle | frozen | current simple | posterior/prototypes only |
+
+R1 与 R2 必须使用：
+
+```text
+相同初始化 checkpoint
+相同 optimizer
+相同 epoch budget
+相同 lr search space
+相同 batch size
+相同 validation selection rule
+```
+
+不要让 R2 因额外超参获得更多 test-time selection 机会。
+
+---
+
+## 1B.7 训练超参数
+
+建议保持 Step 1 的轻量设置：
+
+```text
+epochs: 20
+optimizer: AdamW
+lr candidates: 1e-4, 3e-4, 1e-3
+weight_decay: 1e-4
+grad_clip: 1.0
+```
+
+每组仅使用 validation 选择最佳 epoch / lr。
+
+推荐主选模指标按以下优先级：
+
+1. `ADE_posterior` 最低；
+2. 若接近，则 `posterior↔oracle agreement` 更高；
+3. 再看 mode usage 是否合理。
+
+禁止使用 test 结果选择 R1/R2 或超参。
+
+---
+
+## 1B.8 必须输出的核心指标
+
+validation 和 test 都必须输出：
+
+```text
+ADE_oracle
+ADE_posterior
+G_mode
+posterior↔oracle agreement
+posterior hard usage per mode
+posterior soft usage per mode
+posterior entropy
+posterior max-prob mean
+q_oracle mean
+q_oracle median
+oracle rank distribution
+mode1/2 hard usage
+mode1/2 soft usage
+mode1/2 oracle frequency
+mode1/2 q_oracle
+```
+
+另外输出：
+
+```text
+crossing=0 分组
+crossing=1 分组
+```
+
+重点比较：
+
+```text
+R1 vs R2 的 val→test 泛化差
+R1/R2 是否真正把 mode1/2 的 hard usage 拉向其 oracle frequency
+q_oracle 是否显著提高
+posterior-oracle agreement 是否显著提高
+G_mode 是否显著下降
+```
+
+---
+
+## 1B.9 必须新增“语义恢复”表
+
+报告：
+
+| Method | Oracle ADE | Posterior ADE | G_mode | Post↔Oracle | mode1/2 Oracle Freq | mode1/2 Hard Usage | mode1/2 Soft Usage | q_oracle |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| B0 | ... | ... | ... | ... | ... | ... | ... | ... |
+| R1 Hard oracle | ... | ... | ... | ... | ... | ... | ... | ... |
+| R2 Label-smoothed | ... | ... | ... | ... | ... | ... | ... | ... |
+
+其中 `Oracle ADE` 因 decoder 冻结，理论上三行应一致；若不一致，先检查实现，不解释结果。
+
+---
+
+## 1B.10 Step 1B 的判定逻辑
+
+### Case A：R1 明显成功，R2 同样成功或更稳
+
+典型表现：
+
+```text
+posterior↔oracle 大幅提升
+G_mode 明显下降
+ADE_posterior 明显靠近 ADE_oracle
+mode1/2 hard usage 接近其 oracle frequency
+q_oracle 显著提高
+```
+
+结论：
+
+> 当前 future representation + simple posterior/prototype capacity 基本足够；Step 1 失败的主因是 soft responsibility target 无判别力。
+
+下一步：
+
+```text
+优先进入 Step 2
+```
+
+正式研究 alignment + sharpened trajectory routing。
+
+主方法候选责任目标优先考虑 R2，因为它比 hard oracle 更平滑；R1 保留为 capacity upper-bound / 消融。
+
+---
+
+### Case B：R1 成功，但 R2 明显弱于 R1
+
+结论：
+
+> 当前 posterior 可以学 trajectory semantics，但对 target softness 较敏感。
+
+下一步：
+
+- 仍可进入 Step 2；
+- Step 2 先以 R1 或更小 `epsilon_ls` 的 R2 做受控实验；
+- 不要立即升级 Plan Transformer。
+
+---
+
+### Case C：R1 都无法明显提高 posterior↔oracle / 降低 G_mode
+
+结论：
+
+> 在 frozen representation 下，当前 simple posterior/prototype 无法可靠解码 trajectory oracle mode。
+
+下一步：
+
+```text
+优先进入 Step 3：Temporal Plan Encoder
+```
+
+此时再引入更强 future temporal representation 才有实验证据支持。
+
+不要先进入 Step 2 的 sharpened routing，因为 routing target 本身尚未被 posterior 学会。
+
+---
+
+### Case D：validation 大幅改善但 test 明显退化
+
+结论：
+
+> posterior capacity 可能存在，但当前 oracle supervision / prototype-only fitting 泛化不足。
+
+下一步：
+
+- 比较 R2 是否优于 R1；
+- 检查 train/val/test oracle mode distribution；
+- 检查视频级 bootstrap CI；
+- 不根据 test 重新调 epsilon/lr；
+- 暂不进入复杂联合训练。
+
+---
+
+## 1B.11 必须新增的单元测试
+
+```text
+test_hard_oracle_responsibility_one_hot
+test_label_smoothed_responsibility_sum_to_one
+test_label_smoothed_oracle_has_max_probability
+test_oracle_mode_matches_minade_mode
+test_r1_r2_alignment_stop_gradient_target
+test_step1b_only_posterior_trainable
+test_frozen_decoder_outputs_identical_before_after
+test_oracle_ade_identical_across_b0_r1_r2
+```
+
+K=1 sanity：
+
+```text
+R1 responsibility = [1]
+R2 responsibility = [1]
+G_mode = 0
+posterior↔oracle = 1
+```
+
+---
+
+## 1B.12 Step 1B 输出目录
+
+建议：
+
+```text
+outputs/<base_exp>/step1b_responsibility/
+  B0_baseline/
+  R1_hard_oracle/
+  R2_label_smooth_eps005/
+  R2_label_smooth_eps010/
+  R2_label_smooth_eps020/
+  comparison.json
+  comparison.md
+```
+
+每个训练目录保存：
+
+```text
+config_resolved.yaml
+train.log
+best_posterior.pt
+val_summary.json
+test_summary.json
+mode_diagnostics_val.json
+mode_diagnostics_test.json
+```
+
+只有 validation 选中的 R1 / R2 配置才允许跑 test。
 
 ---
 
 # Step 2：正式加入 Posterior–Trajectory Alignment，并改为 Sharpened Trajectory Routing
 
-> 仅当 Step 1 证明 alignment 有效时，优先执行本步；若 Step 1 明确失败，可先跳到 Step 3，再回来做 Step 2。
+> **仅当 Step 1B 证明至少 R1 或 R2 可以显著学习 trajectory oracle semantics 时，优先执行本步。**
+>
+> 若 Step 1B 的 R1 都失败，则先跳到 Step 3，再回来做 Step 2。
 
 ## 2.1 目的
 
@@ -252,7 +665,16 @@ q_k 低
 联合训练时加入：
 
 ```math
-L_{align}=KL(stopgrad(r)\,\|\,q)
+L_{align}=CE(stopgrad(r),q)
+```
+
+其中 `r` 不再默认使用 Step 1 的近均匀 softmax responsibility。
+
+优先依据 Step 1B 结果选择：
+
+```text
+R2 Label-smoothed oracle 作为主候选
+R1 Hard oracle 作为上界/消融
 ```
 
 总 task loss 中先使用小权重：
@@ -354,7 +776,7 @@ mode-wise hard usage
 
 ## 2.7 Step 2 成功标准
 
-相对 Step 1 / baseline：
+相对 Step 1B / baseline：
 
 - `minADE@4` 不恶化，最好进一步下降；
 - `G_mode` 继续下降；
@@ -371,12 +793,12 @@ mode-wise hard usage
 
 优先在以下情况执行：
 
-- Step 1 alignment-only 无法明显降低 `G_mode`；
-- mode 1/2 soft usage 仍严重塌缩；
+- Step 1B 中 R1 hard oracle 都无法明显降低 `G_mode`；
+- mode 1/2 hard usage 仍无法跟随 oracle frequency；
 - oracle mode 仍大量 rank 3/4；
-- future motion pooling 无法表达 crossing timing / stop-go / acceleration pattern。
+- 当前 future representation / simple pooling 无法解码 trajectory oracle semantics。
 
-如果 Step 1 已经很好，则 Step 3 作为架构消融而不是必选主路线。
+如果 Step 1B 已经很好，则 Step 3 作为架构消融而不是必选主路线。
 
 ---
 
@@ -452,13 +874,13 @@ mode permutation / semantic drift diagnostics
 
 ## 3.5 Step 3 核心对照
 
-| Posterior | Alignment | Routing | 目的 |
+| Posterior | Responsibility | Routing | 目的 |
 |---|---|---|---|
-| simple_pool | off | current | baseline |
-| simple_pool | on | sharpened | Step 2 |
-| plan_transformer | on | sharpened | Step 3 |
+| simple_pool | R1/R2，frozen decoder | unchanged | Step 1B capacity |
+| simple_pool | best R1/R2 | sharpened | Step 2 |
+| plan_transformer | same best R1/R2 | sharpened | Step 3 |
 
-判断 Plan Transformer 是否真的额外降低 `G_mode`，而不是仅靠 alignment 已经解决问题。
+判断 Plan Transformer 是否真的额外降低 `G_mode`，而不是仅靠更有信息量的 responsibility 已经解决问题。
 
 ---
 
@@ -595,6 +1017,8 @@ L_{dualJEPA}
 \lambda_{usage}L_{usage}
 ```
 
+其中 alignment responsibility 必须沿用 Step 1B / Step 2 已验证的定义，不能恢复到近均匀的原 Step 1 soft target。
+
 如果 alignment 仅在下游阶段可稳定计算，也可以先不在纯预训练 A1 使用；Codex 必须根据当前数据流确认 trajectory outputs 在 A1 是否可用，再决定是否启用。
 
 A1 选模：
@@ -669,15 +1093,18 @@ best_prior.pt
 ## 顺序
 
 ```text
-Step 1
-→ Step 2
-→ Step 3（仅当 Step 1/2 表明 posterior capacity 不足，或作为后续结构消融）
+Step 1（已完成，发现 soft responsibility 近均匀）
+→ Step 1B（必须：R1 Hard oracle vs R2 Label-smoothed oracle）
+→ Step 2（仅当 Step 1B 证明 simple posterior 能学 trajectory semantics）
+→ Step 3（若 R1 都失败，优先于 Step 2；否则作为结构消融）
 → Step 4
 → Step 5
 ```
 
 ## 不允许跳过的依赖
 
+- Step 2 不得继续使用 Step 1 的近均匀 soft responsibility；
+- Step 2 必须以 Step 1B 验证过的 R1/R2 结果为依据；
 - Step 4 不能在 posterior 仍严重 collapse 时作为主实验；
 - Step 5 必须基于已确定的 posterior/routing 设计；
 - 不要同时修改 posterior architecture、trajectory routing、prior architecture 和 pretraining schedule 后只报一个结果。
@@ -686,16 +1113,19 @@ Step 1
 
 # 实验编号建议
 
-| ID | Posterior | Alignment | Traj Routing | Prior | Pretrain |
-|---|---|---|---|---|---|
-| R0 | simple | off | current soft-q | state-token MLP | current joint |
-| R1 | simple | alignment-only, decoder frozen | unchanged | frozen | no retrain decoder |
-| R2 | simple | on | sharpened | state-token MLP | current |
-| R3 | Plan Transformer | on | sharpened | state-token MLP | current |
-| R4 | best posterior | on | sharpened | mode-query cross-attn | current |
-| R5 | best posterior | on | sharpened | best prior | A1 + A2 split |
+> 为避免与 Step 1B 的 responsibility 名称 `R1/R2` 冲突，完整模型实验编号改用 `E*`。
 
-主论文版本应由 R0→R1/R2→R3→R4→R5 的证据逐步决定，不预设 R5 一定最好。
+| ID | Posterior | Responsibility / Alignment | Traj Routing | Prior | Pretrain |
+|---|---|---|---|---|---|
+| E0 | simple | off | current soft-q | state-token MLP | current joint |
+| E1-R1 | simple | Hard oracle，decoder frozen | unchanged | frozen | no retrain decoder |
+| E1-R2 | simple | Label-smoothed oracle，decoder frozen | unchanged | frozen | no retrain decoder |
+| E2 | simple | best R1/R2 | sharpened | state-token MLP | current |
+| E3 | Plan Transformer | best R1/R2 | sharpened | state-token MLP | current |
+| E4 | best posterior | best alignment | sharpened | mode-query cross-attn | current |
+| E5 | best posterior | best alignment | sharpened | best prior | A1 + A2 split |
+
+主论文版本应由 E0→E1-R1/E1-R2→E2→E3→E4→E5 的证据逐步决定，不预设 E5 一定最好。
 
 ---
 
@@ -741,9 +1171,14 @@ intent F1/AUC/AP
 Codex 每一步都要保持已有 diagnostics tests 通过，并增加：
 
 ```text
-test_alignment_responsibility_normalization
-test_alignment_stop_gradient_target
-test_alignment_only_freezing
+test_hard_oracle_responsibility_one_hot
+test_label_smoothed_responsibility_sum_to_one
+test_label_smoothed_oracle_has_max_probability
+test_oracle_mode_matches_minade_mode
+test_r1_r2_alignment_stop_gradient_target
+test_step1b_only_posterior_trainable
+test_frozen_decoder_outputs_identical_before_after
+test_oracle_ade_identical_across_b0_r1_r2
 test_sharpened_routing_normalization
 test_sharpened_routing_temperature_effect
 test_hard_routing_optional_path
@@ -757,6 +1192,7 @@ test_best_repr_selection_ignores_prior_kl
 额外 sanity：
 
 ```text
+K=1 时 R1/R2 responsibility 都退化为 [1]
 K=1 时 routing/align 不改变单模式语义
 posterior q / decoder mode / trajectory mode index 始终一致
 future 信息绝不能进入 inference-time prior path
@@ -766,4 +1202,4 @@ future 信息绝不能进入 inference-time prior path
 
 # 给 Codex 的最终执行指令
 
-> 当前任务不是一次性重构整个 EgoJEPA，而是严格按五步实验顺序推进，并在每一步根据验证结果决定下一步。Step 1 先加载当前 JAAD K=4 epoch 88 checkpoint，冻结 decoder、context、trajectory/intention head、prior 与 EMA teacher，只训练 FutureModePosterior，用当前 K 条 trajectory 对 GT 的误差构造 soft trajectory responsibility，并训练 posterior alignment，验证当前 posterior 架构是否能恢复 mode 1/2。Step 2 若 alignment 有效，则正式加入小权重 posterior-trajectory alignment，并把当前 raw q-weighted trajectory loss 改成带温度退火的 sharpened posterior routing，继续监测 mode diversity、G_mode、minADE@4 与 intention 指标。Step 3 只有在 simple posterior 容量不足时，或作为结构消融，将 simple temporal pooling 升级为 2-layer temporal Plan Transformer + learnable plan-query attention pooling，并与 simple posterior 在相同 alignment/routing 条件下公平比较。Step 4 在 posterior 稳定后重新测 G_prior；若仍明显，尤其 crossing subgroup 较大，则把 state-token MLP prior 升级为 K-mode-query cross-attention over full context，并以 G_prior/top1 ADE 而非仅 prior↔posterior agreement 判断有效性。Step 5 最后把 pretraining 拆为 A1 representation + future mode discovery 与 A2 frozen-posterior prior fitting，分别保存 best_repr.pt 和 best_prior.pt，禁止 prior KL 再主导 representation checkpoint selection。每一步必须使用独立配置和输出目录，先跑 validation 再固定配置跑 test，不允许基于 test 调参，也不要把五步改动一次性合并后只跑一个结果。
+> 当前 Step 1 已完成，并发现原 soft trajectory responsibility 的平均最大概率约 0.262，接近 K=4 均匀分布 0.25；因此不要直接进入 sharpened routing，也不要立即升级 Plan Transformer。下一任务是强制执行 Step 1B。加载同一个 JAAD K=4 epoch 88 checkpoint，冻结 decoder、context、mode embeddings、trajectory/intention heads、Past Mode Prior、EMA teacher 和 dual projectors，只训练当前 FutureModePosterior / prototypes。统一以 per-sample pixel ADE 的 argmin 定义 `k_oracle`，并验证其聚合结果等于当前 minADE@4。比较两种 responsibility：R1 Hard oracle，使用 one-hot `k_oracle` 做 4 类交叉熵；R2 Label-smoothed oracle，默认 epsilon=0.10，并只在 validation 可比较 0.05/0.10/0.20。R1 与 R2 使用相同 checkpoint、optimizer、epoch budget、lr 搜索空间和选模规则。validation 选择后才运行 test。必须报告 ADE_oracle、ADE_posterior、G_mode、posterior↔oracle、q_oracle、oracle rank、每 mode hard/soft usage、mode1/2 oracle frequency 与 usage，以及 crossing/non-crossing 分组。若 R1 明显成功，则说明 simple posterior capacity 基本足够，Step 1 失败主要来自 responsibility 无判别力，下一步进入 Step 2；若 R1 都无法明显降低 G_mode，则优先进入 Step 3 Temporal Plan Encoder，不要先做 sharpened routing。后续 Step 2 也不得恢复使用原 Step 1 的近均匀 soft responsibility，应以 Step 1B 验证过的 R1/R2 为基础。每个实验使用独立输出目录，不覆盖原 checkpoint，不允许基于 test 调参。
