@@ -104,7 +104,7 @@ $$
 当前 target：
 
 $$
-z^*=\operatorname{norm}(v^*+m^*)
+z^*=\mathrm{norm}(v^*+m^*)
 $$
 
 视觉未来和运动未来在监督前已经相加，可能丢失模态专属信息。
@@ -180,7 +180,7 @@ future_motion_target: [B, 30, 256]
 首先做 temporal pooling：
 
 $$
-h_f=\operatorname{Pool}(M^*_{1:30})
+h_f=\mathrm{Pool}(M^*_{1:30})
 $$
 
 维护 K 个 learnable prototype：
@@ -194,8 +194,8 @@ soft assignment：
 $$
 q_k
 =
-\operatorname{softmax}\left(
-\frac{\operatorname{sim}(h_f,e_k)}{\tau}
+\mathrm{softmax}\left(
+\frac{\mathrm{sim}(h_f,e_k)}{\tau}
 \right)
 $$
 
@@ -258,7 +258,7 @@ $$
 L_{prior}
 =
 D_{KL}\!\left(
-\operatorname{sg}[q(M\mid Y)]
+\mathrm{sg}[q(M\mid Y)]
 \,\|\,
 p(M\mid C)
 \right)
@@ -344,7 +344,7 @@ $$
 再加入 past mode prior：
 
 $$
-L_{prior}=D_{KL}(\operatorname{sg}[q]\,\|\,\pi)
+L_{prior}=D_{KL}(\mathrm{sg}[q]\,\|\,\pi)
 $$
 
 以及轻量 mode usage regularization $L_{usage}$。
@@ -395,7 +395,7 @@ $$
 计算：
 
 $$
-\operatorname{effective\_modes}=\exp(H(\bar q))
+\mathrm{effective\_modes}=\exp(H(\bar q))
 $$
 
 至少记录：
@@ -476,7 +476,7 @@ $$
 L_{traj}
 =
 \sum_k q_k\,
-\operatorname{SmoothL1}(\hat B^{(k)},B^{gt})
+\mathrm{SmoothL1}(\hat B^{(k)},B^{gt})
 $$
 
 第一版不使用纯 best-of-K：
@@ -512,7 +512,7 @@ $$
 ## 9.1 Mixture supervision
 
 $$
-L_{intent}^{mix}=\operatorname{BCE}(p_{mix},y)
+L_{intent}^{mix}=\mathrm{BCE}(p_{mix},y)
 $$
 
 ## 9.2 Realized-mode supervision
@@ -520,7 +520,7 @@ $$
 $$
 L_{intent}^{assigned}
 =
-\sum_kq_k\operatorname{BCE}(l_k,y)
+\sum_kq_k\mathrm{BCE}(l_k,y)
 $$
 
 最终：
