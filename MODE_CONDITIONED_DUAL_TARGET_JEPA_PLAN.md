@@ -4,30 +4,30 @@
 
 当前 EgoJEPA 使用单一确定性 future latent：
 
-\[
+$$
 C \rightarrow \hat Z_{1:T}
-\]
+$$
 
 其中历史视觉、运动与自车信息融合为 context，30 个 future query 预测唯一的未来潜在序列。该设计面对同一历史对应多个合理未来时，会产生一个关键问题：deterministic JEPA 为了降低预测难度，可能倾向于弱化或过滤那些“不可由过去唯一确定、但对下游轨迹和意图很重要”的未来差异。
 
 本轮改造的目标是把模型改造成：
 
-\[
-C \rightarrow p(M|C)
-\]
+$$
+C \rightarrow p(M\mid C)
+$$
 
 以及：
 
-\[
-(C,M_k)\rightarrow \hat Z^{(k)}_{1:T},\qquad k=1,\dots,K
-\]
+$$
+(C,M_k) \rightarrow \hat Z^{(k)}_{1:T}, \qquad k=1,\dots,K
+$$
 
 其中：
 
-- \(C\)：历史视觉 + 运动 + ego context；
-- \(M\)：latent pedestrian future plan / behavioral mode；
-- \(K\)：未来行为模式数，第一版默认 `K=4`；
-- 每个 mode 产生一组 `[30,256]` future latent；
+- $C$：历史视觉 + 运动 + ego context；
+- $M$：latent pedestrian future plan / behavioral mode；
+- $K$：未来行为模式数，第一版默认 `K=4`；
+- 每个 mode 产生一组 `[30, 256]` future latent；
 - 同一组 mode-conditioned future latent 同时支持轨迹与过街意图预测。
 
 最终核心思想：
@@ -49,15 +49,15 @@ intent_logits:      [B, K]
 
 最终意图概率：
 
-\[
-p(y=1|C)=\sum_k \pi_k\sigma(l_k)
-\]
+$$
+p(y=1\mid C)=\sum_k \pi_k\sigma(l_k)
+$$
 
 默认部署轨迹：
 
-\[
+$$
 k^*=\arg\max_k \pi_k
-\]
+$$
 
 使用 top-1 mode 轨迹作为 K=1-equivalent 结果，同时保留 K 条候选轨迹用于 `minADE@K / minFDE@K`。
 
@@ -103,9 +103,9 @@ k^*=\arg\max_k \pi_k
 
 当前 target：
 
-\[
+$$
 z^*=\operatorname{norm}(v^*+m^*)
-\]
+$$
 
 视觉未来和运动未来在监督前已经相加，可能丢失模态专属信息。
 
@@ -113,29 +113,29 @@ z^*=\operatorname{norm}(v^*+m^*)
 
 保留两个独立 EMA target：
 
-\[
-V^*\in\mathbb R^{B\times30\times256}
-\]
+$$
+V^*\in\mathbb{R}^{B\times30\times256}
+$$
 
-\[
-M^*\in\mathbb R^{B\times30\times256}
-\]
+$$
+M^*\in\mathbb{R}^{B\times30\times256}
+$$
 
 同一个 predicted future latent 通过两个轻量 projector：
 
-\[
+$$
 q_v(\hat Z),\qquad q_m(\hat Z)
-\]
+$$
 
 分别拟合：
 
-\[
+$$
 L_{dual}^{(k)}
 =
-\lambda_v d(q_v(\hat Z^{(k)}),V^*)
+\lambda_v d\!\left(q_v(\hat Z^{(k)}),V^*\right)
 +
-\lambda_m d(q_m(\hat Z^{(k)}),M^*)
-\]
+\lambda_m d\!\left(q_m(\hat Z^{(k)}),M^*\right)
+$$
 
 `d` 第一版继续使用 normalized cosine distance。
 
@@ -179,26 +179,25 @@ future_motion_target: [B, 30, 256]
 
 首先做 temporal pooling：
 
-\[
-h_f=Pool(M^*_{1:30})
-\]
+$$
+h_f=\operatorname{Pool}(M^*_{1:30})
+$$
 
 维护 K 个 learnable prototype：
 
-\[
+$$
 e_1,\dots,e_K
-\]
+$$
 
 soft assignment：
 
-\[
+$$
 q_k
 =
-\operatorname{softmax}
-\left(
-\frac{sim(h_f,e_k)}{\tau}
+\operatorname{softmax}\left(
+\frac{\operatorname{sim}(h_f,e_k)}{\tau}
 \right)
-\]
+$$
 
 输出：
 
@@ -232,9 +231,9 @@ jepa:
 
 新增 `ModePrior`，从过去 context 预测 future mode distribution：
 
-\[
-\pi=p(M|C)
-\]
+$$
+\pi=p(M\mid C)
+$$
 
 第一版建议直接使用 context 的 state token：
 
@@ -255,16 +254,15 @@ prior_probs:  [B, K]
 
 训练目标：
 
-\[
+$$
 L_{prior}
 =
-D_{KL}
-\left(
-sg[q(M|Y)]
-\|\
-p(M|C)
+D_{KL}\!\left(
+\operatorname{sg}[q(M\mid Y)]
+\,\|\,
+p(M\mid C)
 \right)
-\]
+$$
 
 含义：
 
@@ -285,23 +283,17 @@ p(M|C)
 mode_embeddings = nn.Embedding(K, D)
 ```
 
-当前 query：
+当前 query $Q_t$ 改成：
 
-\[
-Q_t
-\]
-
-改成：
-
-\[
+$$
 Q_t^{(k)}=Q_t+e_k
-\]
+$$
 
 然后共享 decoder：
 
-\[
+$$
 \hat Z^{(k)}=P(C,Q^{(k)})
-\]
+$$
 
 最终：
 
@@ -341,37 +333,25 @@ jepa:
 
 # Phase 5：新的 Stage-A JEPA Loss
 
-对每个 mode 计算 dual-target loss：
+对每个 mode 计算 dual-target loss $L_{dual}^{(k)}$，由 future posterior 加权：
 
-\[
-L_{dual}^{(k)}
-\]
-
-由 future posterior 加权：
-
-\[
+$$
 L_{multiJEPA}
 =
 \sum_{k=1}^{K}q_kL_{dual}^{(k)}
-\]
+$$
 
 再加入 past mode prior：
 
-\[
-L_{prior}
-=
-KL(sg[q]\|\pi)
-\]
+$$
+L_{prior}=D_{KL}(\operatorname{sg}[q]\,\|\,\pi)
+$$
 
-以及轻量 mode usage regularization：
-
-\[
-L_{usage}
-\]
+以及轻量 mode usage regularization $L_{usage}$。
 
 最终：
 
-\[
+$$
 \boxed{
 L_A
 =
@@ -381,7 +361,7 @@ L_{multiJEPA}
 +
 \lambda_uL_{usage}
 }
-\]
+$$
 
 默认建议：
 
@@ -408,15 +388,15 @@ lambda_mode_usage: 0.01
 
 首先记录 batch-level posterior：
 
-\[
-\bar q_k=\frac1B\sum_bq_{bk}
-\]
+$$
+\bar q_k=\frac{1}{B}\sum_bq_{bk}
+$$
 
 计算：
 
-\[
-effective\_modes=\exp(H(\bar q))
-\]
+$$
+\operatorname{effective\_modes}=\exp(H(\bar q))
+$$
 
 至少记录：
 
@@ -434,11 +414,11 @@ motion_jepa_loss
 
 如果出现明显 dead mode，再加入 minimum-usage penalty，例如：
 
-\[
+$$
 L_{usage}
 =
 \sum_k\max(0,m-\bar q_k)^2
-\]
+$$
 
 原则：
 
@@ -480,11 +460,9 @@ intention classifier
 
 轨迹头在所有 mode 间共享：
 
-\[
-\hat B^{(k)}
-=
-H_{traj}(\hat Z^{(k)})
-\]
+$$
+\hat B^{(k)}=H_{traj}(\hat Z^{(k)})
+$$
 
 输出：
 
@@ -494,18 +472,18 @@ boxes_all: [B, K, 30, 4]
 
 训练使用 future posterior：
 
-\[
+$$
 L_{traj}
 =
-\sum_k q_k
-SmoothL1(\hat B^{(k)},B^{gt})
-\]
+\sum_k q_k\,
+\operatorname{SmoothL1}(\hat B^{(k)},B^{gt})
+$$
 
 第一版不使用纯 best-of-K：
 
-\[
-\min_kL_k
-\]
+$$
+\min_k L_k
+$$
 
 因为主研究问题要求 mode assignment 由 future representation 定义，而不是由 trajectory error 临时选择。
 
@@ -515,11 +493,9 @@ SmoothL1(\hat B^{(k)},B^{gt})
 
 每个 mode latent 通过同一个 intention head：
 
-\[
-l_k
-=
-H_{intent}(\hat Z^{(k)})
-\]
+$$
+l_k=H_{intent}(\hat Z^{(k)})
+$$
 
 得到：
 
@@ -529,37 +505,33 @@ intent_logits_all: [B, K]
 
 最终 mixture crossing probability：
 
-\[
-p_{mix}
-=
-\sum_k\pi_k\sigma(l_k)
-\]
+$$
+p_{mix}=\sum_k\pi_k\sigma(l_k)
+$$
 
 ## 9.1 Mixture supervision
 
-\[
-L_{intent}^{mix}
-=
-BCE(p_{mix},y)
-\]
+$$
+L_{intent}^{mix}=\operatorname{BCE}(p_{mix},y)
+$$
 
 ## 9.2 Realized-mode supervision
 
-\[
+$$
 L_{intent}^{assigned}
 =
-\sum_kq_kBCE(l_k,y)
-\]
+\sum_kq_k\operatorname{BCE}(l_k,y)
+$$
 
 最终：
 
-\[
+$$
 L_{intent}
 =
 L_{intent}^{mix}
 +
 \eta L_{intent}^{assigned}
-\]
+$$
 
 默认：
 
@@ -577,9 +549,7 @@ task:
 
 # Phase 10：Stage C — Predictor Adaptation + Weak JEPA Anchoring
 
-Stage C 建议：
-
-冻结：
+Stage C 建议冻结：
 
 ```text
 context encoder
@@ -600,7 +570,7 @@ dual projectors
 
 Loss：
 
-\[
+$$
 \boxed{
 L_C
 =
@@ -612,7 +582,7 @@ L_{traj}
 +
 \gamma L_{prior}
 }
-\]
+$$
 
 初始建议：
 
@@ -643,13 +613,7 @@ training:
 
 Codex 必须检查 Stage C 当前是否加载 future RGB。
 
-要求：
-
-```text
-stage_c.jepa_weight > 0
-```
-
-时才需要 future image / future teacher target。
+要求：当 `stage_c.jepa_weight > 0` 时才需要 future image / future teacher target。
 
 若：
 
@@ -681,9 +645,9 @@ stage_c.jepa_weight == 0
 
 其中：
 
-\[
+$$
 k^*=\arg\max_k\pi_k
-\]
+$$
 
 `boxes_top1` 用于和当前 deterministic K=1 baseline 公平比较。
 
@@ -755,9 +719,9 @@ PR-AUC / Average Precision
 
 重点检查：
 
-\[
+$$
 M\leftrightarrow y_{cross}
-\]
+$$
 
 但理想情况不是：
 
@@ -931,13 +895,13 @@ predictable-core / residual 双 decoder
 
 第一版核心只回答：
 
-\[
+$$
 \boxed{
-Deterministic\ JEPA
+\text{Deterministic JEPA}
 \rightarrow
-Mode\text{-}Conditioned\ JEPA
+\text{Mode-Conditioned JEPA}
 }
-\]
+$$
 
 是否改善 trajectory + intention，并保留更好的 multimodal future representation。
 
