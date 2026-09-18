@@ -220,68 +220,297 @@ Codex 不要为了追求更高测试指标重新启用上述失败或未证实�
 
 # 4. 最终训练 / 推理流程必须固定
 
-## 4.1 Representation 初始化
-
-使用当前已经验证的 JEPA representation / checkpoint 初始化路径。
-
-Codex 必须从代码中确认具体 checkpoint lineage，并在最终报告中写清：
-
-```text
-pretrain checkpoint
-任务头初始化方式
-进入 Step 2 前的 checkpoint
-最终 Step 2 checkpoint
-Step 4A prior checkpoint
-```
-
-禁止跨 checkpoint 拼接未记录的权重。
+> **最终训练顺序必须固定为：**
+>
+> ```text
+> Stage A: JEPA pretraining
+>     ↓
+> Stage B: K=4 multimodal trajectory / intention specialization
+>          + FutureModePosterior training-time assignment
+>          + R1 Hard-Oracle alignment
+>          + sharpened trajectory routing
+>     ↓
+> Freeze posterior semantics + candidate generator
+>     ↓
+> Stage C: Past Mode Prior refit
+>     ↓
+> Inference: past-only prior selects top-1 candidate
+> ```
+>
+> **FutureModePosterior 与 Past Mode Prior 不允许从头同时联合训练。**
+>
+> 原因：Posterior 的职责是先利用真实 future 建立稳定的 trajectory-mode semantics；Prior 只能在这些 semantics 稳定后，再学习从过去观测近似它。此前实验已证明，Posterior semantics 改变后如果 Prior 不重新拟合，Top1 ADE 会明显恶化。
 
 ---
 
-## 4.2 Trajectory / intention specialization
+## 4.1 Stage A：JEPA representation pretraining
 
-执行 Step 2 固定配置：
+首先运行现有已经验证的 JEPA pretraining，得到基础 future representation checkpoint。
+
+这一阶段的职责是：
 
 ```text
-R1 Hard-Oracle alignment
+past visual / motion / ego context
+→ future latent representation
+```
+
+Stage A 不负责最终 trajectory mode selection，也不训练最终 Past Mode Prior 去预测尚未稳定的 downstream modes。
+
+Codex 必须从代码中确认并记录：
+
+```text
+JEPA pretrain checkpoint
+pretraining loss 实际组成
+best checkpoint selection rule
+online / EMA target 初始化与更新方式
+```
+
+最终方法**不执行 downstream specialization 后的二次 JEPA re-alignment**；Step 5D 已证明该流程没有稳定正收益。
+
+---
+
+## 4.2 Stage B：FutureModePosterior + K=4 trajectory / intention specialization
+
+加载 Stage A 的 JEPA checkpoint，进入最终多模态 specialization。
+
+这一阶段生成：
+
+```text
+K = 4 future latent hypotheses
+→ K trajectories
+→ K mode-conditioned intention predictions
+```
+
+### FutureModePosterior 的训练位置
+
+**FutureModePosterior 必须在这一阶段训练。**
+
+它使用真实 future 信息：
+
+```math
+q(M\mid Y_{future})
+```
+
+并通过 R1 Hard-Oracle trajectory grounding 学习 mode semantics：
+
+```math
+k^{oracle}=\arg\min_k ADE(B^{(k)},B^{gt})
+```
+
+```math
+L_{align}=-\log(q_{k^{oracle}}+\epsilon)
+```
+
+其作用是：
+
+```text
+训练期 assignment / matching
++
+定义 K 个 trajectory hypotheses 的稳定语义
++
+为 sharpened trajectory routing 提供 q
+```
+
+Posterior 不是 inference-time 模块。
+
+### Sharpened trajectory routing
+
+使用：
+
+```math
+\tilde q_k=
+\frac{q_k^{1/\tau}}
+{\sum_j q_j^{1/\tau}}
+```
+
+```math
+L_{traj}=\sum_k stopgrad(\tilde q_k)L_k
+```
+
+其中：
+
+```math
+L_k=SmoothL1(B^{(k)},B^{gt})
+```
+
+固定 temperature schedule：
+
+```yaml
+tau_start: 1.0
+tau_mid: 0.5
+tau_end: 0.25
+```
+
+最终 task loss：
+
+```math
+L_{task}
+=
+L_{traj}
++
+\lambda_{align}L_{align}
++
+0.5L_{intent}
+```
+
+固定：
+
+```text
 lambda_align = 0.1
-20 epochs
-sharpened routing
-固定 temperature schedule
 ```
 
-不要重新用 test 选 epoch。
+### Stage B 中 Past Mode Prior 的规则
 
-若当前已验证 Step 2 使用固定 epoch 20，则最终复现实验也固定 epoch 20；若代码已有明确 validation checkpoint 规则，则必须在报告中记录并保持一致。
+**Past Mode Prior 不参与 Posterior semantics 的形成。**
+
+主流程中：
+
+```text
+Past Mode Prior = frozen / not optimized
+```
+
+不得让：
+
+```text
+prior KL
+predictability regularization
+prior gradient
+```
+
+反向塑造 FutureModePosterior、trajectory decoder 或 mode embeddings。
+
+只有 Stage B 完成并选定最终 specialization checkpoint 后，才进入 Prior refit。
 
 ---
 
-## 4.3 Prior refit
+## 4.3 Stage B 结束后的冻结点
 
-Step 2 完成后冻结：
+Stage B 完成后，必须将以下内容视为已经固定的 mode semantics：
 
 ```text
 context encoders
-posterior / prototypes
+FutureModePosterior / prototypes
 mode embeddings
 future predictor / decoder
 trajectory head
 intention head
 ```
 
-仅训练：
+进入下一阶段前保存并记录：
 
 ```text
-state-token MLP prior
+final_specialization_checkpoint
+Posterior ADE
+minADE@4
+G_mode
+Posterior↔Oracle
+mode-wise recall / precision
 ```
 
-用 validation prior KL 选 best prior。
+这些权重在 Stage C 中全部冻结。
 
 ---
 
-## 4.4 正式 inference
+## 4.4 Stage C：Past Mode Prior 单独 refit
 
-测试时不得使用 future information。
+**Past Mode Prior 只在 Stage B 的 trajectory modes / Posterior semantics 稳定后训练。**
+
+Prior 只使用过去 context：
+
+```math
+\pi(M\mid X_{past})
+```
+
+固定 Posterior 作为 teacher：
+
+```math
+L_{prior}
+=
+KL(stopgrad(q)\,\|\,\pi)
+```
+
+冻结：
+
+```text
+context encoders
+FutureModePosterior / prototypes
+mode embeddings
+future predictor / decoder
+trajectory head
+intention head
+EMA target encoders
+```
+
+仅训练：
+
+```text
+state-token MLP Past Mode Prior
+```
+
+JAAD 已验证配置：
+
+```text
+lr = 3e-4
+max_epochs = 20
+checkpoint selection = minimum validation prior KL
+```
+
+Stage C 的目的仅是：
+
+> 把已经稳定的 future-aware mode semantics 映射为 past-only mode probabilities。
+
+不得在此阶段重新修改 candidate trajectories 或 Posterior semantics。
+
+---
+
+## 4.5 为什么 Posterior 与 Prior 必须分阶段
+
+最终方法明确采用：
+
+```text
+Posterior first
+→ semantics fixed
+→ Prior refit
+```
+
+而不是：
+
+```text
+Posterior + Prior joint training from scratch
+```
+
+已有实验依据：
+
+1. Step 2 改变 Posterior semantics 后，旧 Prior 的 Top1 ADE 一度显著恶化；
+2. Step 4A 在固定 Posterior 后单独 refit Prior，可显著恢复 Prior↔Posterior 一致率和 Top1 ADE；
+3. Step 5A 让 past predictability 反向约束 Posterior 没有带来额外收益；
+4. 因此最终不采用双向耦合或 Prior 反向塑造 Posterior。
+
+最终 teacher-student 方向固定为：
+
+```math
+Y_{future}
+\rightarrow
+q(M\mid Y_{future})
+\rightarrow
+\pi(M\mid X_{past})
+```
+
+其中第二个箭头只发生在 Stage C 的 Prior refit 中。
+
+---
+
+## 4.6 正式 inference
+
+测试时：
+
+```text
+FutureModePosterior = disabled
+future GT            = unavailable
+oracle assignment    = disabled
+```
+
+只使用：
 
 ```math
 k^{top1}=\arg\max_k \pi_k(X_{past})
@@ -304,13 +533,43 @@ final_IoU
 intention F1 / AUC / AP
 ```
 
-以下只作为机制分析，不得冒充部署指标：
+以下只作为训练机制 / 表征分析，不能作为部署指标：
 
 ```text
 Posterior ADE
 minADE@4
 Posterior↔Oracle
 Oracle mode
+```
+
+---
+
+## 4.7 Checkpoint lineage 必须固定
+
+最终报告必须明确给出：
+
+```text
+Stage A:
+  JEPA pretrain checkpoint
+
+Stage B:
+  JEPA checkpoint
+  → K=4 specialization checkpoint
+  → final Posterior / trajectory-mode semantics
+
+Stage C:
+  frozen Stage B checkpoint
+  → refit state-token MLP Prior
+  → final deployable checkpoint
+```
+
+禁止：
+
+```text
+跨不同实验目录拼接未记录权重
+用测试集选择 Stage B epoch
+用测试集选择 Prior epoch
+在 Prior refit 后重新开启 Posterior / decoder 训练
 ```
 
 ---
